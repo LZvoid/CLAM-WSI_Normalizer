@@ -1,5 +1,6 @@
 import time
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import argparse
 import pdb
 from functools import partial
@@ -14,6 +15,7 @@ import openslide
 from tqdm import tqdm
 
 import numpy as np
+
 
 from utils.file_utils import save_hdf5
 from dataset_modules.dataset_h5 import Dataset_All_Bags, Whole_Slide_Bag_FP
@@ -54,8 +56,8 @@ parser.add_argument('--data_slide_dir', type=str, default=None)
 parser.add_argument('--slide_ext', type=str, default= '.svs')
 parser.add_argument('--csv_path', type=str, default=None)
 parser.add_argument('--feat_dir', type=str, default=None)
-parser.add_argument('--model_name', type=str, default='resnet50_trunc', choices=['resnet50_trunc', 'uni_v1', 'conch_v1'])
-parser.add_argument('--batch_size', type=int, default=256)
+parser.add_argument('--model_name', type=str, default='resnet50_trunc', choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'resnet_18','resnet50.a2_in1k','resnet50.b1k_in1k','resnet50.tv2_in1k'])
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--no_auto_skip', default=False, action='store_true')
 parser.add_argument('--target_patch_size', type=int, default=224)
 args = parser.parse_args()
@@ -90,7 +92,7 @@ if __name__ == '__main__':
 		print('\nprogress: {}/{}'.format(bag_candidate_idx, total))
 		print(slide_id)
 
-		if not args.no_auto_skip and slide_id+'.pt' in dest_files:
+		if not args.no_auto_skip and slide_id+'pt' in dest_files:
 			print('skipped {}'.format(slide_id))
 			continue 
 

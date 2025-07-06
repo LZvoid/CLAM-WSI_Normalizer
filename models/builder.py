@@ -39,7 +39,15 @@ def has_UNI():
 def get_encoder(model_name, target_img_size=224):
     print('loading model checkpoint')
     if model_name == 'resnet50_trunc':
-        model = TimmCNNEncoder()
+        model = TimmCNNEncoder(model_name='resnet50.tv_in1k', kwargs={'features_only': True, 'out_indices': (3,), 'pretrained': True, 'num_classes': 0})
+    elif model_name == 'resnet50.a2_in1k':
+        model = TimmCNNEncoder(model_name='resnet50.a2_in1k', kwargs={'features_only': True, 'out_indices': (3,), 'pretrained': True, 'num_classes': 0})
+    elif model_name == 'resnet50.tv2_in1k':
+        model = TimmCNNEncoder(model_name='resnet50.a2_in1k', kwargs={'features_only': True, 'out_indices': (3,), 'pretrained': True, 'num_classes': 0})
+    elif model_name == 'resnet50.b1k_in1k':
+        model = TimmCNNEncoder(model_name='resnet50.b1k_in1k', kwargs={'features_only': True, 'out_indices': (3,), 'pretrained': True, 'num_classes': 0})
+    elif model_name == 'resnet_18':
+        model = TimmCNNEncoder(model_name='resnet18.tv_in1k', kwargs={'features_only': True, 'out_indices': (3,), 'pretrained': True, 'num_classes': 0})
     elif model_name == 'uni_v1':
         HAS_UNI, UNI_CKPT_PATH = has_UNI()
         assert HAS_UNI, 'UNI is not available'

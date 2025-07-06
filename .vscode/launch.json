@@ -1,0 +1,73 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "特征提取",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "extract_features_fp.py",
+            "console": "integratedTerminal",
+            "args": [
+                // "--source", 
+                // "/mnt/f/c16/CAMELYON16/training/all", 
+                // "--save_dir", 
+                // "/mnt/f/c16/CAMELYON16/training/all_patches", 
+                "--data_h5_dir", 
+                "/mnt/f/test/level1", 
+                "--data_slide_dir", 
+                "/mnt/f/c16/CAMELYON16/training/all",
+                "--slide_ext", 
+                "tif", 
+                "--target_patch_size", 
+                "512",  
+                "--csv_path", 
+                "/mnt/f/test/process_list_autogen.csv",
+                "--feat_dir", 
+                "/mnt/f/test/level1/resnet18",
+                "--model_name",
+                "resnet_18"
+            ]
+        },
+        {
+            "name": "Patch切割",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "create_patches_fp.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--source", 
+                "/mnt/f/c16/CAMELYON16/training/all", 
+                "--save_dir", 
+                "/mnt/f/test/level1", 
+                "--patch_size",
+                "512",
+                "--patch_level",
+                "1",
+                "--patch",
+                "--seg",
+                "--stitch"
+            ]
+        }
+        ,
+        {
+            "name": "extract_features_fp_normalizer 调试",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "extract_features_fp_normalizer.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--data_h5_dir", "/mnt/g/c16/testing",
+                "--data_slide_dir", "/mnt/g/c16/testing/images",
+                "--csv_path", "/mnt/g/c16/testing/process_list_autogen.csv",
+                "--feat_dir", "/mnt/g/c16/testing/features",
+                "--batch_size", "16",
+                "--slide_ext", ".tif",
+                "--target_patch_size", "512"
+            ]
+        }
+    ]
+    
+}
