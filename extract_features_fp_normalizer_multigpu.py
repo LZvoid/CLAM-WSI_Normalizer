@@ -2,7 +2,6 @@ import time
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import argparse
-import pdb
 from functools import partial
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Manager
