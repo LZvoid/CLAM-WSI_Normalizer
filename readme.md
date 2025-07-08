@@ -59,6 +59,7 @@ python create_patches_fp_normalizer.py \
 
 #### 2️⃣ 特征提取
 
+#### 基础版本
 ```bash
 # 标准特征提取
 python extract_features_fp.py \
