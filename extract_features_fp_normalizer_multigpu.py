@@ -1,6 +1,7 @@
 import time
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+# Set a default value for HF_ENDPOINT if it is not already defined
+os.environ['HF_ENDPOINT'] = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
 import argparse
 from functools import partial
 import multiprocessing as mp
