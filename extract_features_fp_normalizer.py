@@ -23,7 +23,7 @@ from wsi_normalizer import imread, TorchVahadaneNormalizer ,MacenkoNormalizer  #
 device = 'cuda'
 #normalizer = MacenkoNormalizer()
 normalizer = TorchVahadaneNormalizer(staintools_estimate=False)
-target = imread("target_imgs/c16_1.png")  # 目标图像路径
+target = imread("target_imgs/optimal_target_512x512_level0_h5.png")  # 目标图像路径
 target = torch.from_numpy(target).to(device)
 normalizer.fit(target)
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -52,7 +52,7 @@ def compute_w_loader(output_path, loader, model, verbose = 0):
 				# 转 uint8
 				img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)
 
-				# ⚠️ 如果 normalizer 用 StainExtractorGPU，需要 staintools_estimate=False
+				# 如果 normalizer 用 StainExtractorGPU，需要 staintools_estimate=False
 				norm_img = normalizer.transform(img_tensor)  # 返回 torch.Tensor (H,W,C) on CUDA
 
 				# 转回 CHW + float

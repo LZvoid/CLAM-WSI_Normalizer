@@ -9,3 +9,7 @@ python create_patches_fp.py --source /mnt/e/dataset/HER2_status/SVS --save_dir /
 python extract_features_fp.py --data_h5_dir /mnt/e/dataset/HER2_status --data_slide_dir /mnt/e/dataset/HER2_status/SVS --csv_path /mnt/e/dataset/HER2_status/process_list_autogen.csv --feat_dir /mnt/e/dataset/HER2_status/features --batch_size 512 --slide_ext .svs
 
 python extract_features_fp_normalizer.py --data_h5_dir /mnt/g/c16/testing --data_slide_dir /mnt/g/c16/testing/images --csv_path /mnt/g/c16/testing/process_list_autogen.csv --feat_dir /mnt/g/c16/testing/features --batch_size 16 --slide_ext .tif --target_patch_size 512
+
+python extract_features_fp_normalizer.py --data_h5_dir /mnt/g/c16/testing --data_slide_dir /mnt/g/c16/testing/images --csv_path /mnt/g/c16/testing/process_list_autogen.csv --feat_dir /mnt/g/c16/testing/features --batch_size 16 --slide_ext .tif --target_patch_size 512
+
+python extract_features_fp_normalizer_opti.py --data_h5_dir /mnt/e/dataset/mhim_c16_h5 --data_slide_dir /mnt/f/c16/CAMELYON16/train --csv_path ./dataset_csv/process_list_autogen.csv --feat_dir /mnt/e/dataset/mhim_c16_features --batch_size 64 --slide_ext .tif --target_patch_size 512
