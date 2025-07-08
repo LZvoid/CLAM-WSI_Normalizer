@@ -1,8 +1,8 @@
 import time
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+# Set a default value for HF_ENDPOINT if it is not already defined
+os.environ['HF_ENDPOINT'] = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
 import argparse
-import pdb
 from functools import partial
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Manager
@@ -418,7 +418,7 @@ def compute_w_loader_batch_parallel(output_path, loader, model, verbose=0, num_g
 parser = argparse.ArgumentParser(description='Feature Extraction')
 parser.add_argument('--data_h5_dir', type=str, default=None)
 parser.add_argument('--data_slide_dir', type=str, default=None)
-parser.add_argument('--slide_ext', type=str, default= '.svs')
+parser.add_argument('--slide_ext', type=str, default='.svs')
 parser.add_argument('--csv_path', type=str, default=None)
 parser.add_argument('--feat_dir', type=str, default=None)
 parser.add_argument('--model_name', type=str, default='resnet50_trunc', choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'resnet_18','resnet50.a2_in1k','resnet50.b1k_in1k','resnet50.tv2_in1k'])
