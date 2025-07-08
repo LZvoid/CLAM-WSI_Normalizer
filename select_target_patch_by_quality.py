@@ -7,7 +7,7 @@ import h5py
 from PIL import Image
 from dataset_modules.dataset_h5 import Dataset_All_Bags
 from wsi_normalizer import TorchVahadaneNormalizer, imread
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 import threading
 from functools import partial
