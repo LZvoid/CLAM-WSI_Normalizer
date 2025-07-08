@@ -35,7 +35,90 @@ else:
 	num_gpus = 0
 	print("CUDA not available, using CPU")
 
-def compute_w_loader(output_path, loader, model, verbose = 0, gpu_id = 0):
+def batch_normalize_efficient(batch, normalizer):
+	"""
+	高效的批量归一化处理
+	"""
+	batch_size, c, h, w = batch.shape
+	
+	# 一次性转换整个batch到HWC格式
+	batch_hwc = batch.permute(0, 2, 3, 1)  # (B,C,H,W) -> (B,H,W,C)
+	
+	# 一次性转换到uint8
+	batch_uint8 = (batch_hwc * 255).clamp(0, 255).to(torch.uint8)
+	
+	# 批量归一化处理
+	normalized_batch = []
+	
+	# 如果normalizer支持批量处理，使用批量模式
+	if hasattr(normalizer, 'transform_batch') and callable(getattr(normalizer, 'transform_batch')):
+		# 使用批量归一化（如果支持）
+		try:
+			norm_batch = normalizer.transform_batch(batch_uint8)
+			norm_batch = norm_batch.permute(0, 3, 1, 2).float() / 255.0
+			return norm_batch
+		except:
+			pass
+	
+	# 优化的逐个处理（减少数据传输开销）
+	for i in range(batch_size):
+		img_tensor = batch_uint8[i]  # 已经在GPU上
+		try:
+			norm_img = normalizer.transform(img_tensor)
+			normalized_batch.append(norm_img)
+		except Exception as e:
+			# 如果归一化失败，使用原始图像
+			norm_img = img_tensor.float() / 255.0
+			norm_img = norm_img.permute(2, 0, 1)  # HWC -> CHW
+			normalized_batch.append(norm_img.permute(1, 2, 0))  # 保持HWC格式用于stack
+	
+	# 一次性堆叠和转换
+	batch_norm = torch.stack(normalized_batch, dim=0)  # (B,H,W,C)
+	batch_norm = batch_norm.permute(0, 3, 1, 2).float() / 255.0  # (B,C,H,W)
+	
+	return batch_norm
+
+def preload_normalizer(device, target_path="target_imgs/optimal_target_512x512_level0_h5.png"):
+	"""
+	预加载和预热normalizer
+	"""
+	normalizer = TorchVahadaneNormalizer(staintools_estimate=False)
+	target = imread(target_path)
+	target = torch.from_numpy(target).to(device)
+	normalizer.fit(target)
+	
+	# 创建一个小的测试图像来预热GPU
+	test_img = torch.randint(0, 256, (224, 224, 3), dtype=torch.uint8, device=device)
+	
+	# 预热normalizer
+	try:
+		_ = normalizer.transform(test_img)
+		print(f"GPU {device}: Normalizer预热完成")
+	except Exception as e:
+		print(f"GPU {device}: Normalizer预热失败: {e}")
+	
+	return normalizer
+
+class OptimizedDataLoader:
+	"""
+	优化的数据加载器，使用预取和并行加载
+	"""
+	def __init__(self, dataset, batch_size, num_workers=8, prefetch_factor=2):
+		self.loader = DataLoader(
+			dataset=dataset, 
+			batch_size=batch_size,
+			num_workers=num_workers,
+			pin_memory=True,
+			prefetch_factor=prefetch_factor,
+			persistent_workers=True if num_workers > 0 else False,
+			drop_last=False
+		)
+	
+	def __iter__(self):
+		return iter(self.loader)
+	
+	def __len__(self):
+		return len(self.loader)
 	"""
 	args:
 		output_path: directory to save computed features (.h5 file)
@@ -43,71 +126,82 @@ def compute_w_loader(output_path, loader, model, verbose = 0, gpu_id = 0):
 		verbose: level of feedback
 		gpu_id: specific GPU ID for this process
 	"""
+def compute_w_loader_optimized(output_path, loader, model, normalizer, verbose=0, gpu_id=0):
+	"""
+	优化的特征提取函数，使用高效批量归一化
+	args:
+		output_path: directory to save computed features (.h5 file)
+		loader: pytorch data loader
+		model: pytorch model
+		normalizer: 归一化器
+		verbose: level of feedback
+		gpu_id: specific GPU ID for this process
+	"""
 	device = torch.device(f'cuda:{gpu_id}')
 	model = model.to(device)
-	
-	# 为当前GPU创建normalizer
-	normalizer = TorchVahadaneNormalizer(staintools_estimate=False)
-	target = imread("target_imgs/c16_1.png")
-	target = torch.from_numpy(target).to(device)
-	normalizer.fit(target)
 	
 	if verbose > 0:
 		print(f'GPU {gpu_id}: processing a total of {len(loader)} batches')
 
 	mode = 'w'
+	
+	# 预分配内存用于缓存
+	features_cache = []
+	coords_cache = []
+	cache_size = 0
+	max_cache_size = 1000  # 每1000个样本写入一次
+	
 	total_patches = 0
 	failed_patches = 0
-	
+
 	for count, data in enumerate(tqdm(loader, desc=f'GPU {gpu_id}')):
 		with torch.inference_mode():
 			batch = data['img']
 			coords = data['coord'].numpy().astype(np.int32)
 			batch = batch.to(device, non_blocking=True).float()
-			batch_norm = []
 			
 			# 显示当前batch在哪个GPU上处理
 			if verbose > 1 and count % 10 == 0:
 				print(f"GPU {gpu_id} - Batch {count}: data shape {batch.shape}")
 			
-			for img_tensor in batch:
-				total_patches += 1
-				# 转 HWC
-				img_tensor = img_tensor.permute(1, 2, 0)  # (C,H,W) -> (H,W,C)
-
-				# 转 uint8
-				img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)
-
-				try:
-					# ⚠️ 如果 normalizer 用 StainExtractorGPU，需要 staintools_estimate=False
-					#注意，使用 TorchVahadaneNormalizer 时，需要修改其transform方法的返回值
-					#将out = out.detach().cpu().numpy()这一行注释掉
-					norm_img = normalizer.transform(img_tensor)  # 返回 torch.Tensor (H,W,C) on CUDA
-					
-					# 转回 CHW + float
-					norm_img = norm_img.permute(2, 0, 1).float() / 255.0
-				except Exception as e:
-					# 如果归一化失败，使用原始图像
-					failed_patches += 1
-					if verbose > 0:
-						print(f"GPU {gpu_id}: Normalization failed for patch {total_patches}: {e}")
-					# 确保 img_tensor 是 torch tensor
-					if isinstance(img_tensor, np.ndarray):
-						img_tensor = torch.from_numpy(img_tensor).to(device)
-					norm_img = img_tensor.permute(2, 0, 1).float() / 255.0
-
-				batch_norm.append(norm_img)
-
-			# 拼 batch
-			batch = torch.stack(batch_norm, dim=0)  # (B,C,H,W)，已在 CUDA
+			total_patches += len(batch)
 			
-			# 单GPU处理
-			features = model(batch)
-			features = features.cpu().numpy().astype(np.float32)
-
-			asset_dict = {'features': features, 'coords': coords}
-			save_hdf5(output_path, asset_dict, attr_dict= None, mode=mode)
-			mode = 'a'
+			try:
+				# 高效批量归一化
+				batch_normalized = batch_normalize_efficient(batch, normalizer)
+				
+				# 特征提取
+				features = model(batch_normalized)
+				features = features.cpu().numpy().astype(np.float32)
+				
+			except Exception as e:
+				# 如果批量归一化失败，使用原始图像
+				failed_patches += len(batch)
+				if verbose > 0:
+					print(f"GPU {gpu_id}: Batch normalization failed for batch {count}: {e}")
+				
+				features = model(batch)
+				features = features.cpu().numpy().astype(np.float32)
+			
+			# 缓存结果
+			features_cache.append(features)
+			coords_cache.append(coords)
+			cache_size += len(features)
+			
+			# 批量写入，减少I/O次数
+			if cache_size >= max_cache_size or count == len(loader) - 1:
+				# 合并缓存的数据
+				combined_features = np.vstack(features_cache)
+				combined_coords = np.vstack(coords_cache)
+				
+				asset_dict = {'features': combined_features, 'coords': combined_coords}
+				save_hdf5(output_path, asset_dict, attr_dict=None, mode=mode)
+				mode = 'a'
+				
+				# 清空缓存
+				features_cache = []
+				coords_cache = []
+				cache_size = 0
 	
 	# 计算失败百分比
 	failure_percentage = (failed_patches / total_patches * 100) if total_patches > 0 else 0
@@ -141,9 +235,12 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 			progress_queue.put(1)
 			return
 		
-		# 初始化模型
+		# 初始化模型和归一化器
 		model, img_transforms = get_encoder(args.model_name, target_img_size=args.target_patch_size)
 		model = model.eval().to(device)
+		
+		# 为当前GPU创建和预热normalizer
+		normalizer = preload_normalizer(device)
 		
 		output_path = os.path.join(args.feat_dir, 'h5_files', bag_name)
 		time_start = time.time()
@@ -153,14 +250,21 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 									wsi=wsi, 
 									img_transforms=img_transforms)
 
+		# 使用优化的数据加载器
 		loader_kwargs = {'num_workers': max(1, args.num_workers // args.num_processes), 'pin_memory': True}
-		loader = DataLoader(dataset=dataset, batch_size=args.batch_size, **loader_kwargs)
+		optimized_loader = OptimizedDataLoader(
+			dataset, 
+			batch_size=args.batch_size,
+			num_workers=loader_kwargs['num_workers'],
+			prefetch_factor=getattr(args, 'prefetch_factor', 2)
+		)
 		
-		output_file_path, failure_percentage = compute_w_loader(output_path, 
-															   loader=loader, 
-															   model=model, 
-															   verbose=1, 
-															   gpu_id=gpu_id)
+		output_file_path, failure_percentage = compute_w_loader_optimized(output_path, 
+																		  loader=optimized_loader, 
+																		  model=model,
+																		  normalizer=normalizer,
+																		  verbose=1, 
+																		  gpu_id=gpu_id)
 		
 		time_elapsed = time.time() - time_start
 		print(f'GPU {gpu_id}: Computing features for {slide_id} took {time_elapsed:.2f}s')
@@ -175,6 +279,9 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 		features = torch.from_numpy(features)
 		bag_base, _ = os.path.splitext(bag_name)
 		torch.save(features, os.path.join(args.feat_dir, 'pt_files', bag_base + '.pt'))
+		
+		# 清理GPU缓存
+		torch.cuda.empty_cache()
 		
 		# 将结果放入队列
 		result = {
@@ -191,6 +298,9 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 		import traceback
 		traceback.print_exc()
 		progress_queue.put(1)
+	finally:
+		if 'wsi' in locals():
+			wsi.close()
 
 
 def distribute_wsis_to_gpus(wsi_list, num_gpus):
@@ -226,7 +336,7 @@ def process_gpu_batch(wsi_batch, args, gpu_id, results_queue, progress_queue):
 
 def compute_w_loader_batch_parallel(output_path, loader, model, verbose=0, num_gpus=1, normalizer=None):
 	"""
-	批次级并行的计算函数（保持与原始版本兼容）
+	批次级并行的优化计算函数
 	"""
 	device = next(model.parameters()).device
 	
@@ -235,6 +345,13 @@ def compute_w_loader_batch_parallel(output_path, loader, model, verbose=0, num_g
 		print(f'Using {num_gpus} GPU(s) for processing')
 
 	mode = 'w'
+	
+	# 预分配内存用于缓存
+	features_cache = []
+	coords_cache = []
+	cache_size = 0
+	max_cache_size = 1000  # 每1000个样本写入一次
+	
 	total_patches = 0
 	failed_patches = 0
 	
@@ -243,50 +360,49 @@ def compute_w_loader_batch_parallel(output_path, loader, model, verbose=0, num_g
 			batch = data['img']
 			coords = data['coord'].numpy().astype(np.int32)
 			batch = batch.to(device, non_blocking=True).float()
-			batch_norm = []
 			
 			# 显示当前batch在哪些GPU上处理
 			if verbose > 1 and count % 10 == 0:
 				print(f"Batch {count}: data shape {batch.shape}, device: {batch.device}")
 			
-			for img_tensor in batch:
-				total_patches += 1
-				# 转 HWC
-				img_tensor = img_tensor.permute(1, 2, 0)  # (C,H,W) -> (H,W,C)
-
-				# 转 uint8
-				img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)
-
-				try:
-					# ⚠️ 如果 normalizer 用 StainExtractorGPU，需要 staintools_estimate=False
-					#注意，使用 TorchVahadaneNormalizer 时，需要修改其transform方法的返回值
-					#将out = out.detach().cpu().numpy()这一行注释掉
-					norm_img = normalizer.transform(img_tensor)  # 返回 torch.Tensor (H,W,C) on CUDA
-					
-					# 转回 CHW + float
-					norm_img = norm_img.permute(2, 0, 1).float() / 255.0
-				except Exception as e:
-					# 如果归一化失败，使用原始图像
-					failed_patches += 1
-					if verbose > 0:
-						print(f"Normalization failed for patch {total_patches}: {e}")
-					# 确保 img_tensor 是 torch tensor
-					if isinstance(img_tensor, np.ndarray):
-						img_tensor = torch.from_numpy(img_tensor).to(device)
-					norm_img = img_tensor.permute(2, 0, 1).float() / 255.0
-
-				batch_norm.append(norm_img)
-
-			# 拼 batch
-			batch = torch.stack(batch_norm, dim=0)  # (B,C,H,W)，已在 CUDA
+			total_patches += len(batch)
 			
-			# DataParallel会自动将batch分配到多个GPU
-			features = model(batch)
-			features = features.cpu().numpy().astype(np.float32)
-
-			asset_dict = {'features': features, 'coords': coords}
-			save_hdf5(output_path, asset_dict, attr_dict= None, mode=mode)
-			mode = 'a'
+			try:
+				# 高效批量归一化
+				batch_normalized = batch_normalize_efficient(batch, normalizer)
+				
+				# DataParallel会自动将batch分配到多个GPU
+				features = model(batch_normalized)
+				features = features.cpu().numpy().astype(np.float32)
+				
+			except Exception as e:
+				# 如果批量归一化失败，使用原始图像
+				failed_patches += len(batch)
+				if verbose > 0:
+					print(f"Batch normalization failed for batch {count}: {e}")
+				
+				features = model(batch)
+				features = features.cpu().numpy().astype(np.float32)
+			
+			# 缓存结果
+			features_cache.append(features)
+			coords_cache.append(coords)
+			cache_size += len(features)
+			
+			# 批量写入，减少I/O次数
+			if cache_size >= max_cache_size or count == len(loader) - 1:
+				# 合并缓存的数据
+				combined_features = np.vstack(features_cache)
+				combined_coords = np.vstack(coords_cache)
+				
+				asset_dict = {'features': combined_features, 'coords': combined_coords}
+				save_hdf5(output_path, asset_dict, attr_dict=None, mode=mode)
+				mode = 'a'
+				
+				# 清空缓存
+				features_cache = []
+				coords_cache = []
+				cache_size = 0
 	
 	# 计算失败百分比
 	failure_percentage = (failed_patches / total_patches * 100) if total_patches > 0 else 0
@@ -315,6 +431,8 @@ parser.add_argument('--monitor_gpu', default=False, action='store_true', help='M
 parser.add_argument('--num_processes', type=int, default=None, help='Number of parallel processes (defaults to number of GPUs)')
 parser.add_argument('--data_parallel_mode', type=str, default='wsi', choices=['wsi', 'batch'], 
                    help='Data parallelism mode: "wsi" for WSI-level parallelism, "batch" for batch-level parallelism')
+parser.add_argument('--prefetch_factor', type=int, default=4, help='Prefetch factor for data loading optimization')
+parser.add_argument('--cache_size', type=int, default=1000, help='Cache size for batch writing optimization')
 args = parser.parse_args()
 
 def print_gpu_memory():
@@ -424,11 +542,8 @@ if __name__ == '__main__':
 		# 使用原始的batch-level并行方式
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		
-		# 创建全局normalizer
-		normalizer = TorchVahadaneNormalizer(staintools_estimate=False)
-		target = imread("target_imgs/c16_1.png")
-		target = torch.from_numpy(target).to(device)
-		normalizer.fit(target)
+		# 创建全局normalizer并预热
+		normalizer = preload_normalizer(device)
 		
 		dest_files = os.listdir(os.path.join(args.feat_dir, 'pt_files'))
 		model, img_transforms = get_encoder(args.model_name, target_img_size=args.target_patch_size)
@@ -442,6 +557,14 @@ if __name__ == '__main__':
 			print(f"Effective batch size: {effective_batch_size}")
 		else:
 			effective_batch_size = args.batch_size
+		
+		# 编译模型以加速（PyTorch 2.0+）
+		if hasattr(torch, 'compile'):
+			try:
+				model = torch.compile(model, mode='max-autotune')
+				print("模型编译成功，性能将得到优化")
+			except:
+				print("模型编译失败，使用常规模式")
 		
 		loader_kwargs = {'num_workers': args.num_workers, 'pin_memory': True} if device.type == "cuda" else {'num_workers': args.num_workers}
 		wsi_statistics = {}
@@ -461,46 +584,65 @@ if __name__ == '__main__':
 
 			output_path = os.path.join(args.feat_dir, 'h5_files', bag_name)
 			time_start = time.time()
-			wsi = openslide.open_slide(slide_file_path)
-			dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, 
-										wsi=wsi, 
-										img_transforms=img_transforms)
-
-			loader = DataLoader(dataset=dataset, batch_size=effective_batch_size, **loader_kwargs)
 			
-			if args.monitor_gpu and torch.cuda.is_available():
-				print("GPU memory before processing:")
-				print_gpu_memory()
-			
-			# 使用原始的compute_w_loader函数（需要适配）
-			output_file_path, failure_percentage = compute_w_loader_batch_parallel(output_path, 
-																				   loader=loader, 
-																				   model=model, 
-																				   verbose=1, 
-																				   num_gpus=num_gpus,
-																				   normalizer=normalizer)
-			
-			if args.monitor_gpu and torch.cuda.is_available():
-				print("GPU memory after processing:")
-				print_gpu_memory()
+			try:
+				wsi = openslide.open_slide(slide_file_path)
+				dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, 
+											wsi=wsi, 
+											img_transforms=img_transforms)
 
-			time_elapsed = time.time() - time_start
-			print('\ncomputing features for {} took {} s'.format(output_file_path, time_elapsed))
-			print(f'Normalization failure rate for {slide_id}: {failure_percentage:.2f}%')
-			
-			wsi_statistics[slide_id] = {
-				'failure_percentage': failure_percentage,
-				'processing_time': time_elapsed
-			}
+				# 使用优化的数据加载器
+				optimized_loader = OptimizedDataLoader(
+					dataset, 
+					batch_size=effective_batch_size,
+					num_workers=args.num_workers,
+					prefetch_factor=args.prefetch_factor
+				)
+				
+				if args.monitor_gpu and torch.cuda.is_available():
+					print("GPU memory before processing:")
+					print_gpu_memory()
+				
+				# 使用优化的compute_w_loader函数
+				output_file_path, failure_percentage = compute_w_loader_batch_parallel(output_path, 
+																					   loader=optimized_loader, 
+																					   model=model, 
+																					   verbose=1, 
+																					   num_gpus=num_gpus,
+																					   normalizer=normalizer)
+				
+				if args.monitor_gpu and torch.cuda.is_available():
+					print("GPU memory after processing:")
+					print_gpu_memory()
 
-			with h5py.File(output_file_path, "r") as file:
-				features = file['features'][:]
-				print('features size: ', features.shape)
-				print('coordinates size: ', file['coords'].shape)
+				time_elapsed = time.time() - time_start
+				print('\ncomputing features for {} took {} s'.format(output_file_path, time_elapsed))
+				print(f'Normalization failure rate for {slide_id}: {failure_percentage:.2f}%')
+				
+				wsi_statistics[slide_id] = {
+					'failure_percentage': failure_percentage,
+					'processing_time': time_elapsed
+				}
 
-			features = torch.from_numpy(features)
-			bag_base, _ = os.path.splitext(bag_name)
-			torch.save(features, os.path.join(args.feat_dir, 'pt_files', bag_base + '.pt'))
+				with h5py.File(output_file_path, "r") as file:
+					features = file['features'][:]
+					print('features size: ', features.shape)
+					print('coordinates size: ', file['coords'].shape)
+
+				features = torch.from_numpy(features)
+				bag_base, _ = os.path.splitext(bag_name)
+				torch.save(features, os.path.join(args.feat_dir, 'pt_files', bag_base + '.pt'))
+				
+				# 清理GPU缓存
+				if torch.cuda.is_available():
+					torch.cuda.empty_cache()
+					
+			except Exception as e:
+				print(f'处理 {slide_id} 时出错: {e}')
+				continue
+			finally:
+				if 'wsi' in locals():
+					wsi.close()
 	
 	# 保存统计信息到文件
 	statistics_file = os.path.join(args.feat_dir, 'normalization_statistics.txt')
@@ -511,7 +653,7 @@ if __name__ == '__main__':
 		f.write(f"GPU Configuration: {num_gpus} GPU(s) - {gpu_ids}\n")
 		f.write(f"Number of Processes: {args.num_processes}\n")
 		if args.data_parallel_mode == 'batch':
-			f.write(f"Effective Batch Size: {effective_batch_size if 'effective_batch_size' in locals() else args.batch_size}\n")
+			f.write(f"Effective Batch Size: {effective_batch_size}\n")
 		f.write(f"Number of Workers: {args.num_workers}\n")
 		f.write("-" * 70 + "\n")
 		f.write(f"{'WSI ID':<30} {'Failure %':<12} {'Time (s)':<10} {'GPU ID':<8}\n")
