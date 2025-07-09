@@ -1,0 +1,16 @@
+# Core dependencies for CLAM
+torch
+torchvision
+timm
+h5py
+openslide-python
+opencv-python
+wsi-normalizer
+pandas
+numpy
+tqdm
+scikit-learn
+matplotlib
+Pillow
+
+
