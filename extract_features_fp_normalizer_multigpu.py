@@ -2,9 +2,17 @@ import time
 import os
 # Set a default value for HF_ENDPOINT if it is not already defined
 os.environ['HF_ENDPOINT'] = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
+
+# 必须在导入torch之前设置多进程启动方法
+import multiprocessing as mp
+try:
+	mp.set_start_method('spawn', force=True)
+	print("多进程启动方法设置为 'spawn'")
+except RuntimeError as e:
+	print(f"多进程启动方法设置失败或已设置: {e}")
+
 import argparse
 from functools import partial
-import multiprocessing as mp
 from multiprocessing import Process, Queue, Manager
 import threading
 
@@ -102,17 +110,36 @@ def preload_normalizer(device, target_path="target_imgs/optimal_target_512x512_l
 class OptimizedDataLoader:
 	"""
 	优化的数据加载器，使用预取和并行加载
+	在多进程环境中使用时会自动调整参数避免pickle错误
 	"""
 	def __init__(self, dataset, batch_size, num_workers=8, prefetch_factor=2):
-		self.loader = DataLoader(
-			dataset=dataset, 
-			batch_size=batch_size,
-			num_workers=num_workers,
-			pin_memory=True,
-			prefetch_factor=prefetch_factor,
-			persistent_workers=True if num_workers > 0 else False,
-			drop_last=False
-		)
+		# 在已经处于多进程环境中时，避免嵌套多进程
+		if num_workers > 0:
+			try:
+				# 检查是否在子进程中
+				if mp.current_process().name != 'MainProcess':
+					num_workers = 0  # 在子进程中强制使用单进程
+					print(f"检测到子进程环境，设置num_workers=0避免pickle错误")
+			except:
+				pass
+		
+		# 构建DataLoader参数
+		loader_kwargs = {
+			'dataset': dataset,
+			'batch_size': batch_size,
+			'num_workers': num_workers,
+			'pin_memory': True if num_workers > 0 else False,
+			'persistent_workers': True if num_workers > 0 else False,
+			'drop_last': False
+		}
+		
+		# 只有当num_workers > 0时才设置prefetch_factor
+		if num_workers > 0:
+			loader_kwargs['prefetch_factor'] = prefetch_factor
+		
+		self.loader = DataLoader(**loader_kwargs)
+		
+		print(f"DataLoader配置: batch_size={batch_size}, num_workers={num_workers}")
 	
 	def __iter__(self):
 		return iter(self.loader)
@@ -217,16 +244,32 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 	"""
 	处理单个WSI的函数，在指定GPU上运行
 	"""
+	wsi = None  # 初始化WSI对象
 	try:
+		# 在子进程中重新设置CUDA设备和环境
 		torch.cuda.set_device(gpu_id)
 		device = torch.device(f'cuda:{gpu_id}')
 		
+		# 清理CUDA缓存
+		torch.cuda.empty_cache()
+		
 		slide_id, bag_candidate_idx, total = wsi_info
 		bag_name = slide_id + '.h5'
-		h5_file_path = os.path.join(args.data_h5_dir, 'patches', bag_name)
+		h5_file_path = os.path.join(args.data_h5_dir, bag_name)
 		slide_file_path = os.path.join(args.data_slide_dir, slide_id + args.slide_ext)
 		
 		print(f'GPU {gpu_id}: Processing {slide_id} ({bag_candidate_idx+1}/{total})')
+		
+		# 检查文件是否存在
+		if not os.path.exists(h5_file_path):
+			print(f'GPU {gpu_id}: H5 file not found: {h5_file_path}')
+			progress_queue.put(1)
+			return
+		
+		if not os.path.exists(slide_file_path):
+			print(f'GPU {gpu_id}: Slide file not found: {slide_file_path}')
+			progress_queue.put(1)
+			return
 		
 		# 检查是否跳过
 		dest_files = os.listdir(os.path.join(args.feat_dir, 'pt_files'))
@@ -235,7 +278,7 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 			progress_queue.put(1)
 			return
 		
-		# 初始化模型和归一化器
+		# 在子进程中重新初始化模型和归一化器
 		model, img_transforms = get_encoder(args.model_name, target_img_size=args.target_patch_size)
 		model = model.eval().to(device)
 		
@@ -250,13 +293,12 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 									wsi=wsi, 
 									img_transforms=img_transforms)
 
-		# 使用优化的数据加载器
-		loader_kwargs = {'num_workers': max(1, args.num_workers // args.num_processes), 'pin_memory': True}
+		# 使用单进程数据加载器避免pickle问题
 		optimized_loader = OptimizedDataLoader(
 			dataset, 
 			batch_size=args.batch_size,
-			num_workers=loader_kwargs['num_workers'],
-			prefetch_factor=getattr(args, 'prefetch_factor', 2)
+			num_workers=0,  # 重要：设置为0避免嵌套多进程导致pickle错误
+			prefetch_factor=2  # 当num_workers=0时会被自动忽略
 		)
 		
 		output_file_path, failure_percentage = compute_w_loader_optimized(output_path, 
@@ -299,8 +341,11 @@ def process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue):
 		traceback.print_exc()
 		progress_queue.put(1)
 	finally:
-		if 'wsi' in locals():
-			wsi.close()
+		if wsi is not None:
+			try:
+				wsi.close()
+			except:
+				pass
 
 
 def distribute_wsis_to_gpus(wsi_list, num_gpus):
@@ -321,9 +366,13 @@ def process_gpu_batch(wsi_batch, args, gpu_id, results_queue, progress_queue):
 	在指定GPU上处理一批WSI
 	"""
 	try:
-		# 设置CUDA设备
+		# 在子进程中重新设置CUDA设备
 		torch.cuda.set_device(gpu_id)
 		print(f"GPU {gpu_id}: Processing {len(wsi_batch)} WSIs")
+		
+		# 在子进程中重新初始化CUDA上下文
+		device = torch.device(f'cuda:{gpu_id}')
+		torch.cuda.empty_cache()
 		
 		for wsi_info in wsi_batch:
 			process_single_wsi(wsi_info, args, gpu_id, results_queue, progress_queue)
@@ -425,7 +474,7 @@ parser.add_argument('--model_name', type=str, default='resnet50_trunc', choices=
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--no_auto_skip', default=False, action='store_true')
 parser.add_argument('--target_patch_size', type=int, default=224)
-parser.add_argument('--num_workers', type=int, default=8, help='Number of workers for data loading')
+parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for data loading')
 parser.add_argument('--gpu_ids', type=str, default=None, help='Comma-separated list of GPU IDs to use (e.g., "0,1,2")')
 parser.add_argument('--monitor_gpu', default=False, action='store_true', help='Monitor GPU memory usage')
 parser.add_argument('--num_processes', type=int, default=None, help='Number of parallel processes (defaults to number of GPUs)')
@@ -445,6 +494,17 @@ def print_gpu_memory():
 
 
 if __name__ == '__main__':
+	# 确保多进程启动方法设置正确
+	try:
+		current_method = mp.get_start_method()
+		if current_method != 'spawn':
+			mp.set_start_method('spawn', force=True)
+			print(f"多进程启动方法从 '{current_method}' 改为 'spawn'")
+		else:
+			print("多进程启动方法已正确设置为 'spawn'")
+	except Exception as e:
+		print(f"设置多进程启动方法时出错: {e}")
+	
 	print('initializing dataset')
 	csv_path = args.csv_path
 	if csv_path is None:
@@ -493,16 +553,17 @@ if __name__ == '__main__':
 		# 分配WSI到不同GPU
 		gpu_assignments = distribute_wsis_to_gpus(wsi_list, num_gpus)
 		
-		# 创建多进程
-		processes = []
-		manager = Manager()
+		# 使用spawn上下文创建多进程
+		ctx = mp.get_context('spawn')
+		manager = ctx.Manager()
 		results_queue = manager.Queue()
 		progress_queue = manager.Queue()
 		
 		# 启动进程
+		processes = []
 		for gpu_id in range(num_gpus):
 			if gpu_assignments[gpu_id]:  # 只为有分配任务的GPU启动进程
-				p = Process(target=process_gpu_batch, 
+				p = ctx.Process(target=process_gpu_batch, 
 						   args=(gpu_assignments[gpu_id], args, gpu_id, results_queue, progress_queue))
 				p.start()
 				processes.append(p)
@@ -572,7 +633,7 @@ if __name__ == '__main__':
 		for bag_candidate_idx in tqdm(range(total)):
 			slide_id = bags_dataset[bag_candidate_idx].split(args.slide_ext)[0]
 			bag_name = slide_id + '.h5'
-			h5_file_path = os.path.join(args.data_h5_dir, 'patches', bag_name)
+			h5_file_path = os.path.join(args.data_h5_dir, bag_name)
 			slide_file_path = os.path.join(args.data_slide_dir, slide_id + args.slide_ext)
 			
 			print('\nprogress: {}/{}'.format(bag_candidate_idx, total))
