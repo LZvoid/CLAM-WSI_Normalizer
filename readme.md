@@ -3,7 +3,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 
-基于 [CLAM](https://github.com/mahmoodlab/CLAM)（Clustering-constrained Attention Multiple Instance Learning）的扩展版本，**专为病理切片染色归一化和多中心数据处理而设计**。本项目新增了染色归一化功能，显著提升了跨中心、跨批次病理数据的一致性和模型泛化能力。
+基于 [CLAM](https://github.com/mahmoodlab/CLAM)（Clustering-constrained Attention Multiple Instance Learning）的扩展版本，**专为病理切片染色归一化和多中心数据处理而设计**。本项目新增了染色归一化功能，支持端到端的WSI染色归一化特征提取。
 
 ## ✨ 主要特性
 
